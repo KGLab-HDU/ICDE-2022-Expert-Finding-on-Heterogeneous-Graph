@@ -1,0 +1,151 @@
+package unsw.util;
+
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
+
+import javafx.util.Pair;
+import unsw.online.BatchSearch;
+import unsw.online.BatchLinker;
+import unsw.online.BatchLinkerCSH;
+import unsw.online.Greedy;
+import unsw.online.MetaPath;
+import unsw.online.basic.FastBCore;
+import unsw.online.edgeDisjoint.EMaxFlow;
+
+/**
+ * @author fangyixiang
+ * @date 24 Sep. 2018
+ * The baseline algorithm, where lazy strategy is adopted for the edge-disjoint core computation
+ */
+public class LazyECore2 {
+	private int graph[][] = null;//data graph, including vertex IDs, edge IDs, and their link relationships
+	private int vertexType[] = null;//vertex -> type
+	private int edgeType[] = null;//edge -> type
+	
+	public LazyECore2(int graph[][], int vertexType[], int edgeType[]) {
+		this.graph = graph;
+		this.vertexType = vertexType;
+		this.edgeType = edgeType;
+	}
+	
+	public Set<Integer> query(int queryId, MetaPath queryMPath, int queryK) {
+		//step 0: check whether queryId's type matches with the meta-path
+		if(queryMPath.vertex[0] != vertexType[queryId])   return null;
+		
+		//step 1: compute the connected subgraph via batch-search with labeling (BSL)
+		BatchLinker batchLinker = new BatchLinker(graph, vertexType, edgeType);
+		Set<Integer> keepSet = batchLinker.link(queryId, queryMPath);
+		if(keepSet == null)   return null;
+		
+		//step 2: perform pruning
+		int SECONDVertexTYPE = queryMPath.vertex[1], SECONDEdgeTYPE = queryMPath.edge[0];
+		Iterator<Integer> keepIter = keepSet.iterator();
+		while(keepIter.hasNext()) {
+			int id = keepIter.next();
+			int count = 0;
+			for(int i = 0;i < graph[id].length;i += 2) {
+				int nbVId = graph[id][i], nbEId = graph[id][i + 1];
+				if(vertexType[nbVId] == SECONDVertexTYPE && edgeType[nbEId] == SECONDEdgeTYPE) {
+					count ++;
+					if(count >= queryK) break;
+				}
+			}
+			if(count < queryK) keepIter.remove();
+		}
+		if(!keepSet.contains(queryId)) return null;
+		
+		//step 3: initialization
+		int pathLen = queryMPath.pathLen;
+		int threshold = (queryK - pathLen * (queryK / pathLen) > 0.0001) ? (queryK / pathLen) : (queryK / pathLen - 1);
+		Map<Integer, Map<Integer, int[]>> allPathMap = new HashMap<Integer, Map<Integer, int[]>>();//vid -> (tid -> path)
+		int visitArr[] = new int[graph.length];//vertices added into queue
+		int degree[] = new int [graph.length];//vertex -> degree
+		
+		//step 4: compute the degree of each vertex using the greedy algorithm
+		Greedy greedy = new Greedy(graph, vertexType, edgeType, queryMPath, keepSet);
+		Queue<Integer> queue = new LinkedList<Integer>();//a queue
+		for(int vid:keepSet) {
+			Set<Integer> visitSet = new HashSet<Integer>();
+			Map<Integer, int[]> pathMap = new HashMap<Integer, int[]>();
+			while(true) {//invoke the greedy algorithm
+				Pair<Integer, int[]> pair = greedy.obtainOneEPath(vid, visitSet, pathMap.keySet());
+				if(pair != null)   pathMap.put(pair.getKey(), pair.getValue());//eNB -> metapath
+				else   break;
+			}
+			
+			degree[vid] = pathMap.size();
+			if(degree[vid] <= threshold) {
+				queue.add(vid);
+				visitArr[vid] = 1;//must delete
+			}else {
+				if(degree[vid] < queryK) {
+					queue.add(vid);
+					visitArr[vid] = 2;//need double check
+				}
+				allPathMap.put(vid, pathMap);
+			}
+		}
+		
+		//step 5: iteratively remove vertices
+		EMaxFlow eMaxFlow = new EMaxFlow(graph, vertexType, edgeType, queryMPath);
+		BatchSearch batchSearch = new BatchSearch(graph, vertexType, edgeType, queryMPath);
+		while(queue.size() > 0) { //System.out.println("|queue|:" + queue.size());
+			int curId = queue.poll();
+			
+			if(visitArr[curId] == 1) {//must delete
+				keepSet.remove(curId);//delete this vertex
+				
+				//update the e-degrees of affected vertices
+				Set<Integer> pnbSet = batchSearch.collect(curId, keepSet);//find the affected vertices
+				for(int pnbId:pnbSet) {
+					if(visitArr[pnbId] == 0) {//impose restriction
+						degree[pnbId] = degree[pnbId] - 1;
+						if(degree[pnbId] < queryK) {
+							queue.add(pnbId);
+							visitArr[pnbId] = 2;//it is not deleted in the first round
+						}
+					}
+				}
+			}else if(visitArr[curId] == 2){//the rest rounds
+				Map<Integer, int[]> pathMap = allPathMap.get(curId);//use the old paths
+				Map<Integer, int[]> maxFlowPathMap = eMaxFlow.obtainEPaths(curId, keepSet, pathMap);//compute the degree in a lazy manner 
+				if(maxFlowPathMap.size() < queryK) {
+					keepSet.remove(curId);//delete this vertex
+					allPathMap.remove(curId);//clean the paths
+					
+					//update the e-degrees of affected vertices
+					Set<Integer> pnbSet = batchSearch.collect(curId, keepSet);//find the affected vertices
+					for(int pnbId:pnbSet) {
+						if(visitArr[pnbId] == 0) {//impose restriction
+							degree[pnbId] = degree[pnbId] - 1;
+							if(degree[pnbId] < queryK) {
+								queue.add(pnbId);
+								visitArr[pnbId] = 2;//it needs double check using max-flow-based algorithm
+							}
+						}
+					}
+				}else {
+					degree[curId] = maxFlowPathMap.size();
+					allPathMap.put(curId, maxFlowPathMap);
+					visitArr[curId] = 0;//this vertex can be enqueued again
+				}
+			}
+		}
+		
+		//step 6: find a connected community
+		Map<Integer, Set<Integer>> tmpPnbMap = new HashMap<Integer, Set<Integer>>();
+		for(int id:keepSet) {
+			Map<Integer, int[]> pathMap = allPathMap.get(id);
+			Set<Integer> set = new HashSet<Integer>();
+			for(int nbId:pathMap.keySet()) set.add(nbId);
+			tmpPnbMap.put(id, set);
+		}
+		BatchLinkerCSH ccFinder = new BatchLinkerCSH(graph, vertexType, edgeType, queryId, queryMPath, keepSet, tmpPnbMap);
+		return ccFinder.computeCC();
+	}
+}
